@@ -10,15 +10,15 @@ from transformers import generation_utils, my_generation_utils
 generation_utils.GenerationMixin.sample = my_generation_utils.GenerationMixin.sample
 
 
-config = AutoConfig.from_pretrained("Salesforce/codegen-350M-mono")
-tokenizer = CodeGenTokenizer.from_pretrained("Salesforce/codegen-350M-mono")
-model = AutoModelForCausalLM.from_pretrained("Salesforce/codegen-350M-mono", config=config)
+config = AutoConfig.from_pretrained("Salesforce/codegen-350M-multi")
+tokenizer = CodeGenTokenizer.from_pretrained("Salesforce/codegen-350M-multi")
+model = AutoModelForCausalLM.from_pretrained("Salesforce/codegen-350M-multi", config=config)
 text = "import math \ndef divSum(n): \n\t'''\n\tWrite a python function to check whether the sum of divisors are same or not.\n\t'''\n\t"
 
 input_ids = tokenizer.encode(text, truncation=True)
 input_ids = torch.tensor([input_ids])
 
-old_time = time.time()
+num_return_sequences = 1
 generated_ids = model.generate(
     input_ids = input_ids,
     text = text,
@@ -26,12 +26,10 @@ generated_ids = model.generate(
     do_sample=True,
     temperature=1e-10,
     # temperature=1.,
-    num_return_sequences=1,
+    num_return_sequences=num_return_sequences,
     # no_repeat_ngram_size=1,
     # remove_invalid_values=True,
 )
-for i in range(1):   
+for i in range(num_return_sequences):   
     print(generated_ids[i])
     print(tokenizer.decode(generated_ids[i], skip_special_tokens=True))
-current_time = time.time()
-print("运行时间为" + str(current_time - old_time) + "s")
