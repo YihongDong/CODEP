@@ -2490,6 +2490,7 @@ class GenerationMixin:
         num_dot = [0] * orig_len
         indent_state = [0] * orig_len
         constraint_state = [0] * orig_len
+        multistring_state = [0] * orig_len
 
         while True:
             if synced_gpus:
@@ -2528,8 +2529,6 @@ class GenerationMixin:
                             print(one.string)
                             pda.update(one)
                 if len(unfinished_tokens[idx]) != 0:
-                    print("*****************")
-                    print(unfinished_tokens)
                     advance_tokens = unfinished_tokens[idx]
                     temp_tokens = []
                     for one in unfinished_tokens[idx]:
@@ -2541,7 +2540,7 @@ class GenerationMixin:
                     unfinished_tokens[idx] = temp_tokens
                     print(unfinished_tokens)
                 else:
-                    advance_tokens = pda.advance(num_state[idx], name_state[idx], string_state[idx], num_dot[idx], indent_state[idx], constraint_state[idx])    
+                    advance_tokens = pda.advance(num_state[idx], name_state[idx], string_state[idx], num_dot[idx], indent_state[idx], constraint_state[idx], multistring_state[idx])    
                 # prepare model inputs
 
                 next_token_logits = outputs.logits[idx, -1, :].unsqueeze(0)
@@ -2549,6 +2548,27 @@ class GenerationMixin:
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids[idx].unsqueeze(0), next_token_logits)
                 next_token_scores = logits_warper(input_ids[idx].unsqueeze(0), next_token_scores)
+                new_next_token_scores = torch.full((next_token_scores.shape[0],next_token_scores.shape[1]),float('-inf'))
+                new_next_token_scores = new_next_token_scores.to(device)
+                is_allinf = 1
+                first_token = [tmp_tokens[0] for tmp_tokens in advance_tokens]
+                first_token = (torch.full_like(torch.tensor(first_token), 0, dtype=torch.long), torch.tensor(first_token, dtype=torch.long))
+                new_next_token_scores.index_put_(indices=first_token, values=next_token_scores[first_token])
+                is_allinf = torch.isinf(new_next_token_scores).all().item()
+                if is_allinf:
+                    new_next_token_scores.index_put_(indices=first_token, values=torch.tensor(1, dtype=torch.float))
+                # for token in advance_tokens: #todo
+                #     if token[0] == []:
+                #         new_next_token_scores = next_token_scores
+                #         break
+                #     else:
+                #         new_next_token_scores[:,token[0]] = next_token_scores[:,token[0]].item()
+                #         if not np.isinf(next_token_scores[:,token[0]].item()):
+                #             is_allinf = 0
+                # if is_allinf:
+                #     for token in advance_tokens:
+                #         new_next_token_scores[:,token[0]] = 1
+                # new_next_token_scores = logits_warper(input_ids[idx].unsqueeze(0), new_next_token_scores)
 
                 # Store scores, attentions and hidden_states when required
                 if return_dict_in_generate:
@@ -2568,32 +2588,11 @@ class GenerationMixin:
                             else (outputs.hidden_states,)
                         )
 
-                new_next_token_scores = torch.full((next_token_scores.shape[0],next_token_scores.shape[1]),float('-inf'))
-                new_next_token_scores = new_next_token_scores.to(device)
-                is_allinf = 1
-                for token in advance_tokens:
-                    if token[0] == []:
-                        new_next_token_scores = next_token_scores
-                        break
-                    else:
-                        new_next_token_scores[:,token[0]] = next_token_scores[:,token[0]].item()
-                        if not np.isinf(next_token_scores[:,token[0]].item()):
-                            is_allinf = 0
-                if is_allinf:
-                    for token in advance_tokens:
-                        new_next_token_scores[:,token[0]] = 1
                 # sample
                 probs = nn.functional.softmax(new_next_token_scores, dim=-1)
 
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
                 if [next_token.item()] not in advance_tokens and len(unfinished_tokens[idx]) == 0 and constraint_state[idx] == 0:
-                    for advance_token in advance_tokens:
-                        if len(advance_token) > 1:                                
-                            if advance_token[0] == next_token.item():
-                                unfinished_tokens[idx].append(advance_token[1:])     
-                                if token_len[idx] == 1:
-                                    token_len[idx] = len(advance_token)
-                                break
                     if name_state[idx] + num_state[idx] +string_state[idx] != 0:
                         token_len[idx] = name_state[idx] + num_state[idx] + string_state[idx]
                         name_state[idx] = 0
@@ -2602,13 +2601,24 @@ class GenerationMixin:
                         string_state[idx] = 0
                         string_quotation[idx] = 0
                         indent_state[idx] = 0
+                        multistring_state[idx] = 0
                         full_token = input_ids[idx,-token_len[idx]:]
                         code = tokenizer.decode(full_token)
                         token_len[idx] = 1
                         token = tokenize(code = code, version_info = parse_version_string('3.7'))
                         for one in token:
                             if one.string != '':
-                                pda.update(one)
+                                try:
+                                    pda.update(one)
+                                except:
+                                    constraint_state[idx] = 1
+                    for advance_token in advance_tokens:
+                        if len(advance_token) > 1:                                
+                            if advance_token[0] == next_token.item():
+                                if token_len[idx] == 1:
+                                    token_len[idx] = len(advance_token)
+                                unfinished_tokens[idx].append(advance_token[1:])     
+                                break
 
 
                 # finished sentences should have their next token be a padding token
@@ -2622,17 +2632,24 @@ class GenerationMixin:
                     if token_len[idx] > 1 and constraint_state[idx] == 0:
                         full_token = torch.cat([input_ids[idx,-token_len[idx]+1:], next_token])
                         code = tokenizer.decode(full_token)
+                        name_state[idx] = 0
+                        num_state[idx] = 0
+                        num_dot[idx] = 0
+                        string_state[idx] = 0
+                        string_quotation[idx] = 0
+                        indent_state[idx] = 0
+                        multistring_state[idx] = 0
                         print("1234")
                         print(input_ids[idx,:])
                         print("full_token")
-                        print(full_token.numpy().tolist())
+                        print(full_token.cpu().cpu().numpy().tolist())
                         print(next_token)
                         print(code)
                         print("1234")
 
                         token_len[idx] = 1
                         token = tokenize(code = code, version_info = parse_version_string('3.7'))
-                        # if full_token.numpy().tolist()[0] == 198:
+                        # if full_token.cpu().numpy().tolist()[0] == 198:
                         #     token = tokenize(code = 'a \n', version_info = parse_version_string('3.7'))
                         #     for one in token:
                         #         if one.string != '' and one.string == '\n':
@@ -2640,13 +2657,16 @@ class GenerationMixin:
                         # else:
                         for one in token:
                             if one.string != '':
-                                pda.update(one)
+                                try:
+                                    pda.update(one)
+                                except:
+                                    constraint_state[idx] = 1
                     else:
                         if [next_token.item()] in first_nametokensid and num_state[idx] == 0 and string_state[idx] == 0 and name_state[idx] == 0 and constraint_state[idx] == 0:
                             name_state[idx] = 1
                         elif [next_token.item()] in first_numtokensid and name_state[idx] == 0 and string_state[idx] == 0 and num_state[idx] == 0 and constraint_state[idx] == 0:
                             num_state[idx] = 1
-                        elif [next_token.item()] == tokenizer.encode('r') or [next_token.item()] == tokenizer.encode(' '+'r'):
+                        elif ([next_token.item()] == tokenizer.encode('r') or [next_token.item()] == tokenizer.encode(' '+'r')) and name_state[idx] == 0 and num_state[idx] == 0 and string_state[idx] == 0 and constraint_state[idx] == 0:
                             string_state[idx] = -1
                         elif [next_token.item()] in first_stringtokensid and name_state[idx] >=0 and num_state[idx] == 0 and string_state[idx] <= 0 and constraint_state[idx] == 0:
                             if string_state[idx] == -1:
@@ -2675,7 +2695,10 @@ class GenerationMixin:
                                 token_len[idx] = 1
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
                             elif [next_token.item()] == [17816] or [next_token.item()] == [37250]:
                                 string_quotation[idx] = 5
                                 token_len[idx] = name_state[idx] + num_state[idx] + string_state[idx]
@@ -2692,7 +2715,10 @@ class GenerationMixin:
                                 token_len[idx] = 1
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
                             elif [next_token.item()] == [5855] or [next_token.item()] == [7203]:
                                 string_quotation[idx] = 6
                                 token_len[idx] = name_state[idx] + num_state[idx] + string_state[idx]
@@ -2709,7 +2735,10 @@ class GenerationMixin:
                                 token_len[idx] = 1
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
                             elif [next_token.item()] == [14631] or [next_token.item()] == [14692]:
                                 string_quotation[idx] = 7
                                 token_len[idx] = name_state[idx] + num_state[idx] + string_state[idx]
@@ -2726,15 +2755,22 @@ class GenerationMixin:
                                 token_len[idx] = 1
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
                             elif [next_token.item()] == [7061] or [next_token.item()] == [10148] or [next_token.item()] == [13538] or [next_token.item()] == [15931]:
+                                multistring_state[idx] = 1
                                 code = tokenizer.decode(next_token)
                                 token_len[idx] = 1
                                 string_state[idx] = 0
                                 token = tokenize(code = code, version_info = parse_version_string('3.7'))
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
                         elif [next_token.item()] in last_nametokensid and num_state[idx] == 0 and string_state[idx] == 0 and name_state[idx] >= 1 and constraint_state[idx] == 0:
                             name_state[idx] += 1
                         elif [next_token.item()] in last_numtokensid1 and name_state[idx] == 0 and string_state[idx] == 0 and num_state[idx] >= 1 and num_dot[idx] == 0 and constraint_state[idx] == 0:
@@ -2747,13 +2783,14 @@ class GenerationMixin:
                             string_state[idx] += 1
                             print("8888888888888888")
                             print(string_quotation[idx], [next_token.item()], string_state[idx])
-                            if ((string_quotation[idx] == 1 or string_quotation[idx] == 6 or string_quotation[idx] == 7) and ('"' in tokenizer.decode([next_token.item()])))  or ((string_quotation[idx] == 2 or string_quotation[idx] == 4 or string_quotation[idx] == 5) and ("'" in tokenizer.decode([next_token.item()]))):
+                            if ((string_quotation[idx] == 1 or string_quotation[idx] == 6 or string_quotation[idx] == 7) and ('"' in tokenizer.decode([next_token.item()]) and tokenizer.decode([next_token.item()]) != '\\"'))  or ((string_quotation[idx] == 2 or string_quotation[idx] == 4 or string_quotation[idx] == 5) and ("'" in tokenizer.decode([next_token.item()]) and tokenizer.decode([next_token.item()]) != "\\'")):
                                 token_len[idx] = name_state[idx] + num_state[idx] + string_state[idx]
                                 name_state[idx] = 0
                                 num_state[idx] = 0
                                 num_dot[idx] = 0
                                 string_state[idx] = 0
                                 indent_state[idx] = 0
+                                multistring_state[idx] = 0
                                 if token_len[idx] >= 1:
                                     full_token = torch.cat([input_ids[idx,-token_len[idx]+1:], next_token])
                                 print(full_token)
@@ -2767,8 +2804,14 @@ class GenerationMixin:
                                 token = tokenize(code = code, version_info = parse_version_string('3.7'))
                                 string_quotation[idx] = 0
                                 for one in token:
-                                    if one.string != '':
-                                        pda.update(one)
+                                    if one.string != '' and one.type != ERRORTOKEN:
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
+                                    elif one.type == ERRORTOKEN:
+                                        tmp_code[idx] = one.string
+                                        #todo
                             elif string_quotation[idx] == 3 and [next_token.item()] == [198]:
                                 token_len[idx] = name_state[idx] + num_state[idx] + string_state[idx]
                                 name_state[idx] = 0
@@ -2776,6 +2819,7 @@ class GenerationMixin:
                                 num_dot[idx] = 0
                                 string_state[idx] = 0
                                 string_quotation[idx] = 0
+                                multistring_state[idx] = 0
                                 indent_state[idx] = 0
                                 if token_len[idx] >= 1:
                                     full_token = torch.cat([input_ids[idx,-token_len[idx]+1:], next_token])
@@ -2784,7 +2828,10 @@ class GenerationMixin:
                                 token = tokenize(code = code, version_info = parse_version_string('3.7'))
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
                                 indent_state[idx] = 1
 
                         else:
@@ -2797,6 +2844,7 @@ class GenerationMixin:
                             num_dot[idx] = 0
                             string_state[idx] = 0
                             string_quotation[idx] = 0
+                            multistring_state[idx] = 0
                             if token_len[idx] >= 1:
                                 full_token = torch.cat([input_ids[idx,-token_len[idx]:], next_token])
                             code = tokenizer.decode(full_token)
@@ -2804,117 +2852,167 @@ class GenerationMixin:
                             print(token_len[idx])
                             print(input_ids[idx,:])
                             print("full_token")
-                            print(full_token.numpy().tolist())
+                            print(full_token.cpu().numpy().tolist())
                             print(next_token)
                             print(code)
                             print("123456")
                             token_len[idx] = 1
                             token = tokenize(code = code, version_info = parse_version_string('3.7'))
-                            if full_token.numpy().tolist()[0] == 198 and constraint_state[idx] == 0:
+                            if full_token.cpu().numpy().tolist()[0] == 198 and constraint_state[idx] == 0:
                                 indent_state[idx] = 1
                                 token = tokenize(code = 'a \n', version_info = parse_version_string('3.7'))
                                 for one in token:
                                     if one.string == '\n':
-                                        pda.update(one)
-                            elif full_token.numpy().tolist()[-1]== 198 and constraint_state[idx] == 0:
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[-1]== 198 and constraint_state[idx] == 0:
                                 indent_state[idx] = 1
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 197 and constraint_state[idx] == 0:
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 197 and constraint_state[idx] == 0:
                                 indent_state[idx] = 0
                                 token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
                                 if pda.indent == 0:
                                     for one in token:
                                         if one.type == INDENT:
-                                            pda.update(one)
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
                                 else:
                                     for one in token:
                                         if one.type == DEDENT:
                                             for i in range(1,pda.indent):
-                                                pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 50294 and constraint_state[idx] == 0:
+                                                try:
+                                                    pda.update(one)
+                                                except:
+                                                    constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 50294 and constraint_state[idx] == 0:
                                 indent_state[idx] = 0
                                 token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
                                 if pda.indent == 1:
                                     for one in token:
                                         if one.type == INDENT:
-                                            pda.update(one)
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
                                 else:
                                     for one in token:
                                         if one.type == DEDENT:
                                             for i in range(2,pda.indent):
-                                                pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 50293 and constraint_state[idx] == 0:
+                                                try:
+                                                    pda.update(one)
+                                                except:
+                                                    constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 50293 and constraint_state[idx] == 0:
                                 indent_state[idx] = 0
                                 token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
                                 if pda.indent == 2:
                                     for one in token:
                                         if one.type == INDENT:
-                                            pda.update(one)
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
                                 else:
                                     for one in token:
                                         if one.type == DEDENT:
                                             for i in range(3,pda.indent):
-                                                pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 50292 and constraint_state[idx] == 0:
+                                                try:
+                                                    pda.update(one)
+                                                except:
+                                                    constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 50292 and constraint_state[idx] == 0:
                                 indent_state[idx] = 0
                                 token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
                                 if pda.indent == 3:
                                     for one in token:
                                         if one.type == INDENT:
-                                            pda.update(one)
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
                                 else:
                                     for one in token:
                                         if one.type == DEDENT:
                                             for i in range(4,pda.indent):
-                                                pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 50291 and constraint_state[idx] == 0:
+                                                try:
+                                                    pda.update(one)
+                                                except:
+                                                    constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 50291 and constraint_state[idx] == 0:
                                 indent_state[idx] = 0
                                 token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
                                 if pda.indent == 4:
                                     for one in token:
                                         if one.type == INDENT:
-                                            pda.update(one)
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
                                 else:
                                     for one in token:
                                         if one.type == DEDENT:
                                             for i in range(5,pda.indent):
-                                                pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 50290 and constraint_state[idx] == 0:
+                                                try:
+                                                    pda.update(one)
+                                                except:
+                                                    constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 50290 and constraint_state[idx] == 0:
                                 indent_state[idx] = 0
                                 token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
                                 if pda.indent == 5:
                                     for one in token:
                                         if one.type == INDENT:
-                                            pda.update(one)
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
                                 else:
                                     for one in token:
                                         if one.type == DEDENT:
                                             for i in range(6,pda.indent):
-                                                pda.update(one)
+                                                try:
+                                                    pda.update(one)
+                                                except:
+                                                    constraint_state[idx] = 1
                             elif indent_state[idx] == 1 and constraint_state[idx] == 0:
-                                print("1111111111")
                                 indent_state[idx] = 0
                                 temp_token = tokenize(code = '\ta', version_info = parse_version_string('3.7'))
+                                print("%%%%%%%%%%%%%%%%%")
+                                print(pda.indent)
                                 for one in temp_token:
                                     if one.type == DEDENT:
                                         for i in range(pda.indent):
-                                            pda.update(one)
-                                if full_token.numpy().tolist()[0] == 4299:
+                                            try:
+                                                pda.update(one)
+                                            except:
+                                                constraint_state[idx] = 1
+                                if full_token.cpu().numpy().tolist()[0] == 4299:
                                     constraint_state[idx] = 1
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
-                            elif full_token.numpy().tolist()[0] == 4299:
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
+                            elif full_token.cpu().numpy().tolist()[0] == 4299:
                                 constraint_state[idx] = 1
-                                print("66666666666666666666666")
                             elif constraint_state[idx] == 0:
-                                print("222222222")
                                 indent_state[idx] = 0
                                 for one in token:
                                     if one.string != '':
-                                        pda.update(one)
+                                        try:
+                                            pda.update(one)
+                                        except:
+                                            constraint_state[idx] = 1
 
 
                 if not def_nextokens: #判断next_tokens是否定义
@@ -4347,7 +4445,7 @@ def load_grammar(version= None, path= None):
 
 grammar = load_grammar('3.7')
 first_dfa = grammar._pgen_grammar.nonterminal_to_dfas[grammar._start_nonterminal][0]
-tokenizer = CodeGenTokenizer.from_pretrained("Salesforce/codegen-350M-mono")
+tokenizer = CodeGenTokenizer.from_pretrained("Salesforce/codegen-350M-multi")
 first_numtokensid = []
 last_numtokensid1 = []
 last_numtokensid2 = []
@@ -4356,6 +4454,8 @@ last_nametokensid = []
 first_stringtokensid = []
 last_stringtokensid1 = []
 removed_stringtokens = []
+multi_removed_stringtokens = []
+tmp_removed_stringtokens = []
 mykeyword = []
 final_mykeyword = []
 mykeyword.extend(tokenizer.tokenize(kw) for kw in keyword.kwlist)
@@ -4377,8 +4477,13 @@ for one in tokenizer.get_vocab().keys():
         first_stringtokensid.append([tokenizer.get_vocab().get(one)])
     if (re.match('^"\W$', one) or re.match("^'\W$", one) or re.match('^Ġ"\W$', one) or re.match("^Ġ'\W$", one)) and one[-1] != '"' and one[-1] != "'":
         removed_stringtokens.append(one)
-first_stringtokensid.append(tokenizer.encode('r'))
-first_stringtokensid.append(tokenizer.encode(' '+'r'))
+    # re.match('^"\W$', one) or re.match("^'\W$", one) or
+    if re.match("^'$", one) or re.match('^"$', one):
+        multi_removed_stringtokens.append(one)
+    if re.match('^[\'"][a-zA-Z]+$', one):
+        tmp_removed_stringtokens.append(one)
+# first_stringtokensid.append(tokenizer.encode('r'))
+# first_stringtokensid.append(tokenizer.encode(' '+'r'))
 first_stringtokensid.append(tokenizer.encode('"'))
 first_stringtokensid.append(tokenizer.encode('#'))
 first_stringtokensid.append(tokenizer.encode("'"))
@@ -4386,6 +4491,8 @@ first_nametokensid.remove(tokenizer.encode("r"))
 first_nametokensid.remove(tokenizer.encode(" "+"r"))
 # first_stringtokensid = [[1],[2],[6],[705],[366],[7061],[10148],[13538],[15931],[10786],[19203],[17816],[37250],[5855],[7203],[14631],[14692],[81],[374]]
 last_stringtokensid = [[a] for a in range(50295)]
+for one in tmp_removed_stringtokens:
+    last_stringtokensid.remove(tokenizer.encode(one))
         
 
 
@@ -4397,7 +4504,7 @@ class PDA:
         self.reserved_action_types = []
         self.pytoken_action_types = []
     
-    def advance(self, num_state, name_state, string_state, num_dot, indent_state, constraint_state):
+    def advance(self, num_state, name_state, string_state, num_dot, indent_state, constraint_state, multistring_state):
         tem_hyp = self.PDA.copy()
         action_types = set(tem_hyp.stack[-1].dfa.transitions.keys())
         while tem_hyp.stack[-1].dfa.is_final:
@@ -4409,8 +4516,6 @@ class PDA:
         pytoken_action_types = sorted(pytoken_action_types)
         print(reserved_action_types)
         print(pytoken_action_types)
-        print("￥￥￥￥￥￥￥￥￥￥￥￥￥￥￥￥")
-        print(self.indent)
         force_flexible_ids = []
         if num_state == 0 and name_state == 0 and string_state <= 0 and indent_state == 0 and constraint_state == 0:
             for one in reserved_action_types:
@@ -4589,6 +4694,9 @@ class PDA:
                     force_flexible_ids.append(tokenizer.encode("\n"))
                 if one == 'INDENT':
                     force_flexible_ids.append(tokenizer.encode("\t"))
+            if multistring_state == 1:
+                for one in multi_removed_stringtokens:
+                    force_flexible_ids.remove(tokenizer.encode(one))
         elif name_state >= 1 and constraint_state == 0:
             if name_state == 1:
                 new_PDA = self.PDA.copy()
@@ -4798,20 +4906,6 @@ class PDA:
             for one in removed_stringtokens:
                 if one[-1] not in self.reserved_action_types:
                     force_flexible_ids.remove(tokenizer.encode(one.replace("Ġ"," ")))
-            # if "." not in self.reserved_action_types:
-            #     force_flexible_ids.remove(tokenizer.encode("'."))
-            #     force_flexible_ids.remove(tokenizer.encode(" " + "'."))
-            # if ")" not in self.reserved_action_types:
-            #     force_flexible_ids.remove(tokenizer.encode("')"))
-            #     force_flexible_ids.remove(tokenizer.encode('")'))
-            # if ":" not in self.reserved_action_types:
-            #     force_flexible_ids.remove(tokenizer.encode("':"))
-            #     force_flexible_ids.remove(tokenizer.encode('":'))
-            # if "," not in self.reserved_action_types:
-            #     force_flexible_ids.remove(tokenizer.encode("',"))
-            #     force_flexible_ids.remove(tokenizer.encode(" "+"',"))
-            # if "]" not in self.reserved_action_types:
-            #     force_flexible_ids.remove(tokenizer.encode("']"))
         elif num_state >= 1 and constraint_state == 0:
             if num_state == 1:
                 new_PDA = self.PDA.copy()
@@ -5004,13 +5098,17 @@ class PDA:
                 force_flexible_ids.extend(last_numtokensid1)
         elif indent_state == 1 and constraint_state == 0:
             force_flexible_ids = []
-            if "INDENT" in pytoken_action_types:
+            print("**********")
+            print(self.indent)
+            if "INDENT" in pytoken_action_types and len(pytoken_action_types) == 1:
                 force_flexible_ids.append(tokenizer.encode("\t"*(self.indent+1)))
+            elif len(pytoken_action_types) > 1 and self.indent != 0:
+                force_flexible_ids.append(tokenizer.encode("\t"*self.indent))
+            elif "INDENT" not in pytoken_action_types and len(pytoken_action_types) == 1 and self.indent != 0:
+                force_flexible_ids.append(tokenizer.encode("\t"*self.indent))
             if "DEDENT" in pytoken_action_types:
                 for indent_num in range(1,self.indent):
                     force_flexible_ids.append(tokenizer.encode("\t"*indent_num))
-            if self.indent != 0:
-                force_flexible_ids.append(tokenizer.encode("\t"*self.indent))
             
             for one in reserved_action_types:
                 if one == ":":
@@ -5249,3 +5347,4 @@ from parso.python.token import PythonTokenTypes
 INDENT = PythonTokenTypes.INDENT
 DEDENT = PythonTokenTypes.DEDENT
 ENDMARKER = PythonTokenTypes.ENDMARKER
+ERRORTOKEN = PythonTokenTypes.ERRORTOKEN
