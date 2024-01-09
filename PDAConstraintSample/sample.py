@@ -6,12 +6,12 @@ from parso.python.tokenize import tokenize
 from parso.utils import parse_version_string
 import torch
 import time
-from transformers import generation_utils, my_generation_utils, new_my_generation_utils
+from transformers import generation_utils, my_generation_utils
 import traceback
 import sys
 
 # 补丁
-generation_utils.GenerationMixin.sample = new_my_generation_utils.GenerationMixin.sample
+generation_utils.GenerationMixin.sample = my_generation_utils.GenerationMixin.sample
 
 torch.manual_seed(0)
 
